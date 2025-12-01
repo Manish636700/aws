@@ -8,44 +8,41 @@ textract = boto3.client("textract")
 s3 = boto3.client("s3")
 
 DEST_BUCKET = os.environ.get("DEST_BUCKET")
-
-# How long to poll for Textract job completion (seconds)
-MAX_WAIT_SECS = int(os.environ.get("MAX_WAIT_SECS", "600"))  # 10 minutes
+MAX_WAIT_SECS = int(os.environ.get("MAX_WAIT_SECS", "600"))
 POLL_INTERVAL = float(os.environ.get("POLL_INTERVAL", "2.0"))
 
+IMAGE_EXTS_SYNC = {".jpg", ".jpeg", ".png"}
+ASYNC_EXTS = {".pdf", ".tif", ".tiff"}
+
 def start_text_job(bucket, key):
-    response = textract.start_document_text_detection(
+    resp = textract.start_document_text_detection(
         DocumentLocation={"S3Object": {"Bucket": bucket, "Name": key}}
     )
-    return response["JobId"]
+    return resp["JobId"]
 
 def wait_for_job(job_id, max_wait=MAX_WAIT_SECS, poll=POLL_INTERVAL):
     waited = 0.0
     while waited <= max_wait:
         status = textract.get_document_text_detection(JobId=job_id, MaxResults=1)
-        job_status = status["JobStatus"]
-        if job_status in ("SUCCEEDED", "FAILED", "PARTIAL_SUCCESS"):
-            return job_status
-        time.sleep(poll)
-        waited += poll
+        st = status["JobStatus"]
+        if st in ("SUCCEEDED", "FAILED", "PARTIAL_SUCCESS"):
+            return st
+        time.sleep(poll); waited += poll
     raise TimeoutError(f"Textract job {job_id} did not complete in time.")
 
 def get_all_pages(job_id):
     pages = []
-    next_token = None
+    token = None
     while True:
         kwargs = {"JobId": job_id, "MaxResults": 1000}
-        if next_token:
-            kwargs["NextToken"] = next_token
+        if token: kwargs["NextToken"] = token
         resp = textract.get_document_text_detection(**kwargs)
         pages.append(resp)
-        next_token = resp.get("NextToken")
-        if not next_token:
-            break
+        token = resp.get("NextToken")
+        if not token: break
     return pages
 
-def blocks_to_plain_text(textract_pages):
-    # Concatenate LINE text in document order
+def blocks_to_plain_text_from_pages(textract_pages):
     lines = []
     for page in textract_pages:
         for b in page.get("Blocks", []):
@@ -53,46 +50,58 @@ def blocks_to_plain_text(textract_pages):
                 lines.append(b["Text"])
     return "\n".join(lines)
 
+def blocks_to_plain_text_from_single(resp):
+    lines = []
+    for b in resp.get("Blocks", []):
+        if b.get("BlockType") == "LINE" and "Text" in b:
+            lines.append(b["Text"])
+    return "\n".join(lines)
+
 def lambda_handler(event, context):
     if not DEST_BUCKET:
         raise RuntimeError("Environment variable DEST_BUCKET is required.")
 
-    # S3 event can contain multiple records
     for record in event.get("Records", []):
         src_bucket = record["s3"]["bucket"]["name"]
         src_key = unquote_plus(record["s3"]["object"]["key"])
+        _, ext = os.path.splitext(src_key.lower())
 
-        # Only process PDFs
-        if not src_key.lower().endswith(".pdf"):
+        # Skip unsupported types
+        if ext not in IMAGE_EXTS_SYNC | ASYNC_EXTS:
             continue
 
-        # Start Textract async job
-        job_id = start_text_job(src_bucket, src_key)
-
-        # Wait for completion (simple polling; for very large PDFs consider SNS/SQS pattern)
-        status = wait_for_job(job_id)
-        if status != "SUCCEEDED":
-            raise RuntimeError(f"Textract job failed or partial: {status}")
-
-        # Collect all pages
-        pages = get_all_pages(job_id)
-
-        # Prepare outputs
-        doc_text = blocks_to_plain_text(pages)
-        result_json = {
-            "SourceBucket": src_bucket,
-            "SourceKey": src_key,
-            "TextractJobId": job_id,
-            "Pages": pages,  # full Textract responses (can be large)
-        }
-
-        # Destination object keys (mirror path under a folder)
         base_name = os.path.basename(src_key).rsplit(".", 1)[0]
         prefix = f"textract/{src_bucket}/{os.path.dirname(src_key)}/".replace("//", "/")
         out_json_key = f"{prefix}{base_name}.textract.json"
-        out_txt_key = f"{prefix}{base_name}.txt"
+        out_txt_key  = f"{prefix}{base_name}.txt"
 
-        # Put JSON and TXT to destination bucket
+        if ext in ASYNC_EXTS:
+            # Async path: PDF/TIFF
+            job_id = start_text_job(src_bucket, src_key)
+            status = wait_for_job(job_id)
+            if status != "SUCCEEDED":
+                raise RuntimeError(f"Textract job failed or partial: {status}")
+            pages = get_all_pages(job_id)
+            doc_text = blocks_to_plain_text_from_pages(pages)
+            result_json = {
+                "SourceBucket": src_bucket,
+                "SourceKey": src_key,
+                "TextractJobId": job_id,
+                "Pages": pages,
+            }
+        else:
+            # Sync path: JPEG/PNG images
+            resp = textract.detect_document_text(
+                Document={"S3Object": {"Bucket": src_bucket, "Name": src_key}}
+            )
+            doc_text = blocks_to_plain_text_from_single(resp)
+            result_json = {
+                "SourceBucket": src_bucket,
+                "SourceKey": src_key,
+                "TextractAPI": "DetectDocumentText",
+                "Response": resp,
+            }
+
         s3.put_object(
             Bucket=DEST_BUCKET,
             Key=out_json_key,
